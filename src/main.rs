@@ -8,12 +8,16 @@ use async_openai::types::{
     ChatCompletionRequestSystemMessageArgs, ChatCompletionRequestUserMessageArgs,
     CreateChatCompletionRequestArgs,
 };
+use indicatif::ProgressBar;
 use serde::Serialize;
 use serenity::all::{ChannelId, GatewayIntents, GuildChannel, Message};
 use serenity::client::ClientBuilder;
-use serenity::futures;
+use serenity::futures::stream::{self, StreamExt};
 use serenity::model::Timestamp;
+use serenity::Client;
 use url::Url;
+
+const RUN_IN_PARALLEL: usize = 100;
 
 #[tokio::main]
 async fn main() -> anyhow::Result<()> {
@@ -27,24 +31,27 @@ async fn main() -> anyhow::Result<()> {
 
     let help_channel_id = ChannelId::new(1028701743917301892);
     let mut before_timestamp: Option<Timestamp> = None;
-    for _ in 0..10 {
+    loop {
         let archived_threads = discord_client
             .http
-            .get_channel_archived_public_threads(
-                help_channel_id,
-                before_timestamp.map(|t| t.unix_timestamp() as u64),
-                Some(100),
-            )
+            .get_channel_archived_public_threads(help_channel_id, before_timestamp, Some(100))
             .await?;
 
-        for GuildChannel { id, thread_metadata, .. } in archived_threads.threads {
-            before_timestamp = thread_metadata.and_then(|tm| tm.archive_timestamp);
-            let messages = discord_client.http.get_messages(id, None, None).await?;
-            let content = generate_conversation(&messages);
-            let conversation_url = discord_conversation_url(guild_id, id);
-            let ConversationSummary { title, body } =
-                generate_tech_summary(&openai_client, &content).await?;
-            let conv = SummarizedConversation { id, conversation_url, title, body };
+        let pb = ProgressBar::new(archived_threads.threads.len() as u64);
+        let stream: Vec<anyhow::Result<_>> = pb
+            .wrap_stream(
+                stream::iter(archived_threads.threads)
+                    .map(|channel| {
+                        ask_bot_for_summary(&discord_client, &openai_client, guild_id, channel)
+                    })
+                    .buffered(RUN_IN_PARALLEL),
+            )
+            .collect()
+            .await;
+
+        for result in stream {
+            let conv @ SummarizedConversation { archived_timestamp, .. } = result?;
+            before_timestamp = archived_timestamp;
             serde_json::to_writer(&mut output_file, &conv)?;
             writeln!(&mut output_file)?;
         }
@@ -59,11 +66,28 @@ async fn main() -> anyhow::Result<()> {
     Ok(())
 }
 
+async fn ask_bot_for_summary(
+    discord_client: &Client,
+    openai_client: &async_openai::Client<OpenAIConfig>,
+    guild_id: u64,
+    GuildChannel { id, thread_metadata, .. }: GuildChannel,
+) -> anyhow::Result<SummarizedConversation> {
+    let messages = discord_client.http.get_messages(id, None, None).await?;
+    let content = generate_conversation(&messages);
+    let conversation_url = discord_conversation_url(guild_id, id);
+    Ok(SummarizedConversation {
+        id,
+        archived_timestamp: thread_metadata.and_then(|tm| tm.archive_timestamp),
+        conversation_url,
+        body: generate_tech_summary(openai_client, &content).await?,
+    })
+}
+
 #[derive(Debug, Serialize)]
 struct SummarizedConversation {
     id: ChannelId,
+    archived_timestamp: Option<Timestamp>,
     conversation_url: Url,
-    title: String,
     body: String,
 }
 
@@ -85,11 +109,11 @@ fn generate_conversation(messages: &[Message]) -> String {
 async fn generate_tech_summary(
     client: &async_openai::Client<OpenAIConfig>,
     conversation: &str,
-) -> anyhow::Result<ConversationSummary> {
+) -> anyhow::Result<String> {
     const TECH_SUMMARIZE_PROMPT: &str = include_str!("../tech-summarize.prompt.txt");
 
     let request = CreateChatCompletionRequestArgs::default()
-        .model("gpt-4")
+        .model("gpt-3.5-turbo")
         .messages([
             ChatCompletionRequestSystemMessageArgs::default()
                 .content(TECH_SUMMARIZE_PROMPT)
@@ -104,16 +128,5 @@ async fn generate_tech_summary(
 
     let response = client.chat().create(request).await?;
     let first_choice = response.choices.into_iter().next().unwrap();
-    let summary = first_choice.message.content.unwrap();
-    match summary.split_once('\n') {
-        Some((title, body)) => {
-            Ok(ConversationSummary { title: title.to_owned(), body: body.to_owned() })
-        }
-        None => Ok(ConversationSummary { title: String::new(), body: summary }),
-    }
-}
-
-struct ConversationSummary {
-    title: String,
-    body: String,
+    Ok(first_choice.message.content.unwrap())
 }

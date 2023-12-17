@@ -5,5 +5,3 @@ The content should be articulated in a not too professional tone, supplemented w
 Intended for the Meilisearch help center documentation, your summary should be efficient, aiming to encapsulate the key points in no more than three paragraphs, whenever possible. It is vital to convey this information as general guidance, not as a reflection of a specific interaction.
 
 Refrain from contributing any commentary until a conversational exchange is presented to you.
-
-Output a short title at the first line without prefixing it by any character. It must summarizes well the conversation.

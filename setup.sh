@@ -7,7 +7,7 @@ echo '{
                 "openAi": {}
             },
             "documentTemplate": {
-                "template": "The conversation is titled {{doc.title}} and here is a summary of it: {{doc.body}}"
+                "template": "You will find a summary of the conversation below\n{{doc.body}}"
             }
         }
     }
