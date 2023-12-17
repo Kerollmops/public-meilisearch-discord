@@ -1,40 +1,74 @@
-use async_openai::{
-    config::OpenAIConfig,
-    types::{ChatCompletionRequestUserMessageArgs, CreateChatCompletionRequestArgs},
-};
-use serenity::{
-    all::{ChannelId, GatewayIntents, GuildChannel, Message},
-    client::ClientBuilder,
-};
 use std::fmt::Write as _;
+use std::fs::File;
+use std::io::Write as _;
+
+use anyhow::Context;
+use async_openai::config::OpenAIConfig;
+use async_openai::types::{
+    ChatCompletionRequestSystemMessageArgs, ChatCompletionRequestUserMessageArgs,
+    CreateChatCompletionRequestArgs,
+};
+use serde::Serialize;
+use serenity::all::{ChannelId, GatewayIntents, GuildChannel, Message};
+use serenity::client::ClientBuilder;
+use serenity::futures;
+use serenity::model::Timestamp;
+use url::Url;
 
 #[tokio::main]
 async fn main() -> anyhow::Result<()> {
     let guild_id: u64 = 1006923006964154428;
     let token = std::env::var("BOT_TOKEN").unwrap();
-    let client = ClientBuilder::new(token, GatewayIntents::MESSAGE_CONTENT).await?;
+    let discord_client = ClientBuilder::new(token, GatewayIntents::MESSAGE_CONTENT).await?;
+    let openai_client = async_openai::Client::new();
+    let output_filename = "summarizes.jsonl";
+    let mut output_file = File::create(output_filename)
+        .with_context(|| format!("while opening {output_filename}"))?;
 
     let help_channel_id = ChannelId::new(1028701743917301892);
-    let archived_threads = client
-        .http
-        .get_channel_archived_public_threads(help_channel_id, None, None)
-        .await?;
+    let mut before_timestamp: Option<Timestamp> = None;
+    for _ in 0..10 {
+        let archived_threads = discord_client
+            .http
+            .get_channel_archived_public_threads(
+                help_channel_id,
+                before_timestamp.map(|t| t.unix_timestamp() as u64),
+                Some(100),
+            )
+            .await?;
 
-    let openai_client = async_openai::Client::new();
+        for GuildChannel { id, thread_metadata, .. } in archived_threads.threads {
+            before_timestamp = thread_metadata.and_then(|tm| tm.archive_timestamp);
+            let messages = discord_client.http.get_messages(id, None, None).await?;
+            let content = generate_conversation(&messages);
+            let conversation_url = discord_conversation_url(guild_id, id);
+            let ConversationSummary { title, body } =
+                generate_tech_summary(&openai_client, &content).await?;
+            let conv = SummarizedConversation { id, conversation_url, title, body };
+            serde_json::to_writer(&mut output_file, &conv)?;
+            writeln!(&mut output_file)?;
+        }
 
-    // let channel_id = ChannelId::new(1183817817846456350);
-    for GuildChannel { id, .. } in archived_threads.threads.into_iter().take(usize::MAX) {
-        let messages = client.http.get_messages(id, None, None).await?;
-        let content = generate_conversation(&messages);
-        eprintln!("https://discord.com/channels/{guild_id}/{id}");
-        eprintln!("{content}");
-        let summary = generate_tech_summary(&openai_client, &content).await?;
-        eprintln!("-------------- SUMMARY --------------");
-        eprintln!("{summary}");
-        eprintln!("-------------------------------------");
+        if !archived_threads.has_more {
+            break;
+        }
     }
 
+    output_file.flush()?;
+
     Ok(())
+}
+
+#[derive(Debug, Serialize)]
+struct SummarizedConversation {
+    id: ChannelId,
+    conversation_url: Url,
+    title: String,
+    body: String,
+}
+
+fn discord_conversation_url(guild_id: u64, id: ChannelId) -> Url {
+    Url::parse(&format!("https://discord.com/channels/{guild_id}/{id}")).unwrap()
 }
 
 fn generate_conversation(messages: &[Message]) -> String {
@@ -51,24 +85,35 @@ fn generate_conversation(messages: &[Message]) -> String {
 async fn generate_tech_summary(
     client: &async_openai::Client<OpenAIConfig>,
     conversation: &str,
-) -> anyhow::Result<String> {
+) -> anyhow::Result<ConversationSummary> {
     const TECH_SUMMARIZE_PROMPT: &str = include_str!("../tech-summarize.prompt.txt");
 
     let request = CreateChatCompletionRequestArgs::default()
         .model("gpt-4")
-        .messages([ChatCompletionRequestUserMessageArgs::default()
-            .content(format!(
-                "```plain text
-                {conversation}
-                ```
-
-                {TECH_SUMMARIZE_PROMPT}"
-            ))
-            .build()?
-            .into()])
+        .messages([
+            ChatCompletionRequestSystemMessageArgs::default()
+                .content(TECH_SUMMARIZE_PROMPT)
+                .build()?
+                .into(),
+            ChatCompletionRequestUserMessageArgs::default()
+                .content(format!("```plain text\n{conversation}\n```"))
+                .build()?
+                .into(),
+        ])
         .build()?;
 
     let response = client.chat().create(request).await?;
     let first_choice = response.choices.into_iter().next().unwrap();
-    Ok(first_choice.message.content.unwrap())
+    let summary = first_choice.message.content.unwrap();
+    match summary.split_once('\n') {
+        Some((title, body)) => {
+            Ok(ConversationSummary { title: title.to_owned(), body: body.to_owned() })
+        }
+        None => Ok(ConversationSummary { title: String::new(), body: summary }),
+    }
+}
+
+struct ConversationSummary {
+    title: String,
+    body: String,
 }
